@@ -104,9 +104,60 @@ typedef int		(*DRI2ScheduleSwapProcPtr)(ClientPtr client,
 						   CARD64 remainder,
 						   DRI2SwapEventPtr func,
 						   void *data);
+
+/**
+ * Schedule a video buffer swap
+ *
+ * Drivers should queue an event for the frame count that satisfies the
+ * parameters passed in.  If the event is in the future (i.e. the conditions
+ * aren't currently satisfied), the server may block the client at the next
+ * GLX request using DRI2WaitSwap. When the event arrives, drivers should call
+ * \c DRI2SwapComplete, which will handle waking the client and returning
+ * the appropriate data.
+ *
+ * The DDX is responsible for doing an overlay buffer flip/exchange, or
+ * scaling/colorconvert blit when the corresponding event arrives.
+ *
+ * If the target drawable is resized/damaged, or the osd pixmap is changed/
+ * damaged, ScheduleSwapVid can be re-invoked by the core with the same
+ * source buffer to repair the dri2 video drawable.
+ * XXX TODO this part isn't implemented in core yet..
+ *
+ * \param client client pointer (used for block/unblock)
+ * \param pDraw drawable whose count we want
+ * \param pDestBuffer current front buffer
+ * \param pSrcBuffer current back buffer
+ * \param b the crop box
+ * \param osd the on-screen-display overlay pixmap, should be an ARGB pixmap
+ *   that is blended on top of the video as part of swap.  Multiple layers
+ *   to blend over the video should be flattened into a single layer by the
+ *   client
+ * \param target_msc frame count to wait for
+ * \param divisor divisor for condition equation
+ * \param remainder remainder for division equation
+ * \param func function to call when the swap completes
+ * \param data data for the callback \p func.
+ */
+typedef int		(*DRI2ScheduleSwapVidProcPtr)(ClientPtr client,
+						   DrawablePtr pDraw,
+						   DRI2BufferPtr pDestBuffer,
+						   DRI2BufferPtr pSrcBuffer,
+						   BoxPtr b,
+						   DrawablePtr osd,
+						   CARD64 *target_msc,
+						   CARD64 divisor,
+						   CARD64 remainder,
+						   DRI2SwapEventPtr func,
+						   void *data);
+
 typedef DRI2BufferPtr	(*DRI2CreateBufferProcPtr)(DrawablePtr pDraw,
 						   unsigned int attachment,
 						   unsigned int format);
+typedef DRI2BufferPtr	(*DRI2CreateBufferVidProcPtr)(DrawablePtr pDraw,
+						   unsigned int attachment,
+						   unsigned int format,
+						   unsigned int width,
+						   unsigned int height);
 typedef void		(*DRI2DestroyBufferProcPtr)(DrawablePtr pDraw,
 						    DRI2BufferPtr buffer);
 /**
@@ -182,10 +233,46 @@ typedef void		(*DRI2InvalidateProcPtr)(DrawablePtr pDraw,
 typedef Bool		(*DRI2SwapLimitValidateProcPtr)(DrawablePtr pDraw,
 							int swap_limit);
 
+
+/**
+ * An ugly approach to avoid changing DRI2BufferPtr and cause ABI breakage
+ * between driver and xserver.  This only needs to be implemented by drivers
+ * supporting planar formats with one buffer per plane.
+ *
+ * This might be a good argument for having drivers in-tree ;-)
+ *
+ * \param pDraw drawable that the buffer belongs to
+ * \param buf the DRI2 buffer
+ * \param names array of buffer names
+ * \param pitches array of buffer pitches
+ * \return the number of additional buffers, ie. for I420 tri-planar buffer,
+ * if represented as multiple buffer names, the Y buffer name would be in
+ * buf->name, this function would return 2, and return the U and V buffer
+ * names by reference.
+ */
+typedef unsigned int	(*DRI2GetExtraBufferNamesProcPtr)(DrawablePtr pDraw,
+	DRI2BufferPtr buf, unsigned int **names, unsigned int **pitches);
+
+/**
+ * Length in multiple of CARD32's, passed in value should be copied by
+ * receiver
+ */
+typedef int (*DRI2SetAttributeProcPtr)(DrawablePtr pDraw, Atom attribute,
+	int len, const CARD32 *val);
+
+/**
+ * Length in multiple of CARD32's, returned val should *not* be free'd
+ * (unlike similar function on client side) to avoid temporary allocation
+ * and extra copy.
+ */
+typedef int (*DRI2GetAttributeProcPtr)(DrawablePtr pDraw, Atom attribute,
+	int *len, const CARD32 **val);
+
+
 /**
  * Version of the DRI2InfoRec structure defined in this header
  */
-#define DRI2INFOREC_VERSION 6
+#define DRI2INFOREC_VERSION 7
 
 typedef struct {
     unsigned int version;	/**< Version of this struct */
@@ -218,6 +305,17 @@ typedef struct {
 
     DRI2ReuseBufferNotifyProcPtr ReuseBufferNotify;
     DRI2SwapLimitValidateProcPtr SwapLimitValidate;
+
+    /* added in version 7 */
+
+    unsigned int numFormats;
+    const unsigned int *formats;
+    DRI2GetExtraBufferNamesProcPtr GetExtraBufferNames;
+    DRI2CreateBufferVidProcPtr	CreateBufferVid;
+    DRI2ScheduleSwapVidProcPtr	ScheduleSwapVid;
+    DRI2SetAttributeProcPtr	SetAttribute;
+    DRI2GetAttributeProcPtr	GetAttribute;
+
 }  DRI2InfoRec, *DRI2InfoPtr;
 
 extern _X_EXPORT int DRI2EventBase;
@@ -279,12 +377,21 @@ extern _X_EXPORT DRI2BufferPtr *DRI2GetBuffersWithFormat(DrawablePtr pDraw,
 	int *width, int *height, unsigned int *attachments, int count,
 	int *out_count);
 
+extern _X_EXPORT DRI2BufferPtr * DRI2GetBuffersVid(DrawablePtr pDraw,
+	int width, int height, unsigned int *attachments, int count,
+	int *out_count);
+
 extern _X_EXPORT void DRI2SwapInterval(DrawablePtr pDrawable, int interval);
 extern _X_EXPORT Bool DRI2SwapLimit(DrawablePtr pDraw, int swap_limit);
 extern _X_EXPORT int DRI2SwapBuffers(ClientPtr client, DrawablePtr pDrawable,
 				     CARD64 target_msc, CARD64 divisor,
 				     CARD64 remainder, CARD64 *swap_target,
 				     DRI2SwapEventPtr func, void *data);
+
+extern _X_EXPORT int DRI2SwapBuffersVid(ClientPtr client, DrawablePtr pDraw,
+	CARD64 target_msc, CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
+	unsigned int source, BoxPtr b, DRI2SwapEventPtr func, void *data);
+
 extern _X_EXPORT Bool DRI2WaitSwap(ClientPtr client, DrawablePtr pDrawable);
 
 extern _X_EXPORT int DRI2GetMSC(DrawablePtr pDrawable, CARD64 *ust,
@@ -313,5 +420,23 @@ extern _X_EXPORT void DRI2SwapComplete(ClientPtr client, DrawablePtr pDraw,
 extern _X_EXPORT void DRI2WaitMSCComplete(ClientPtr client, DrawablePtr pDraw,
 					  int frame, unsigned int tv_sec,
 					  unsigned int tv_usec);
+
+extern _X_EXPORT int DRI2SetAttribute(DrawablePtr pDraw, Atom attribute,
+	int len, const CARD32 *val);
+extern _X_EXPORT int DRI2GetAttribute(DrawablePtr pDraw, Atom attribute,
+	int *len, const CARD32 **val);
+extern _X_EXPORT int DRI2GetFormats(ScreenPtr pScreen,
+	unsigned int *nformats, unsigned int **formats);
+
+extern _X_EXPORT unsigned int DRI2GetExtraBufferNames(DrawablePtr pDraw,
+	DRI2BufferPtr buf, unsigned int **names, unsigned int **pitches);
+
+
+/* some utility macros.. maybe could go elsewhere? */
+#define FOURCC(a, b, c, d) (((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24 )))
+#define FOURCC_STR(str)    FOURCC(str[0], str[1], str[2], str[3])
+#ifndef ARRAY_SIZE
+#  define ARRAY_SIZE(_a)   (sizeof((_a)) / sizeof((_a)[0]))
+#endif
 
 #endif

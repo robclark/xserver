@@ -91,6 +91,8 @@ typedef struct _DRI2Screen {
     int				 refcnt;
     unsigned int		 numDrivers;
     const char			**driverNames;
+    unsigned int		 numFormats;
+    unsigned int		*formats;
     const char			*deviceName;
     int				 fd;
     unsigned int		 lastSequence;
@@ -104,11 +106,26 @@ typedef struct _DRI2Screen {
     DRI2AuthMagicProcPtr	 AuthMagic;
     DRI2ReuseBufferNotifyProcPtr ReuseBufferNotify;
     DRI2SwapLimitValidateProcPtr SwapLimitValidate;
+    DRI2GetExtraBufferNamesProcPtr GetExtraBufferNames;
+    DRI2CreateBufferVidProcPtr	 CreateBufferVid;
+    DRI2ScheduleSwapVidProcPtr	 ScheduleSwapVid;
+    DRI2SetAttributeProcPtr	 SetAttribute;
+    DRI2GetAttributeProcPtr	 GetAttribute;
 
     HandleExposuresProcPtr       HandleExposures;
 
     ConfigNotifyProcPtr		 ConfigNotify;
 } DRI2ScreenRec;
+
+static Bool
+supports_video(DRI2ScreenPtr ds)
+{
+    /* it would be easier if we had a way to track the driverType in the
+     * DRI2DrawablePtr.. but the DRI2DrawablePtr isn't created at the
+     * time of DRI2Connect()..
+     */
+    return ds && ds->numFormats && ds->CreateBufferVid && ds->ScheduleSwapVid;
+}
 
 static DRI2ScreenPtr
 DRI2GetScreen(ScreenPtr pScreen)
@@ -297,15 +314,26 @@ DRI2CreateDrawable(ClientPtr client, DrawablePtr pDraw, XID id,
     return Success;
 }
 
+static void destroy_buffers(DrawablePtr pDraw, DRI2BufferPtr *buffers, int count)
+{
+    if (buffers != NULL) {
+	DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
+	int i;
+	for (i = 0; i < count; i++)
+	    if (buffers[i])
+		(*ds->DestroyBuffer)(pDraw, buffers[i]);
+
+	free(buffers);
+    }
+}
+
 static int DRI2DrawableGone(pointer p, XID id)
 {
     DRI2DrawablePtr pPriv = p;
-    DRI2ScreenPtr   ds = pPriv->dri2_screen;
     DRI2DrawableRefPtr ref, next;
     WindowPtr pWin;
     PixmapPtr pPixmap;
     DrawablePtr pDraw;
-    int i;
 
     list_for_each_entry_safe(ref, next, &pPriv->reference_list, link) {
 	if (ref->dri2_id == id) {
@@ -337,12 +365,7 @@ static int DRI2DrawableGone(pointer p, XID id)
 	dixSetPrivate(&pPixmap->devPrivates, dri2PixmapPrivateKey, NULL);
     }
 
-    if (pPriv->buffers != NULL) {
-	for (i = 0; i < pPriv->bufferCount; i++)
-	    (*ds->DestroyBuffer)(pDraw, pPriv->buffers[i]);
-
-	free(pPriv->buffers);
-    }
+    destroy_buffers(pDraw, pPriv->buffers, pPriv->bufferCount);
 
     free(pPriv);
 
@@ -350,7 +373,7 @@ static int DRI2DrawableGone(pointer p, XID id)
 }
 
 static int
-find_attachment(DRI2DrawablePtr pPriv, unsigned attachment)
+find_attachment(DRI2DrawablePtr pPriv, unsigned attachment, DRI2BufferPtr *buf)
 {
     int i;
 
@@ -361,6 +384,8 @@ find_attachment(DRI2DrawablePtr pPriv, unsigned attachment)
     for (i = 0; i < pPriv->bufferCount; i++) {
 	if ((pPriv->buffers[i] != NULL)
 	    && (pPriv->buffers[i]->attachment == attachment)) {
+	    if (buf)
+		*buf = pPriv->buffers[i];
 	    return i;
 	}
     }
@@ -369,12 +394,24 @@ find_attachment(DRI2DrawablePtr pPriv, unsigned attachment)
 }
 
 static Bool
+valid_format(DRI2ScreenPtr ds, unsigned int format)
+{
+    int i;
+    for (i = 0; i < ds->numFormats; i++) {
+	if (format == ds->formats[i]) {
+	    return TRUE;
+	}
+    }
+    return FALSE;
+}
+
+static Bool
 allocate_or_reuse_buffer(DrawablePtr pDraw, DRI2ScreenPtr ds,
 			 DRI2DrawablePtr pPriv,
 			 unsigned int attachment, unsigned int format,
 			 int dimensions_match, DRI2BufferPtr *buffer)
 {
-    int old_buf = find_attachment(pPriv, attachment);
+    int old_buf = find_attachment(pPriv, attachment, NULL);
 
     if ((old_buf < 0)
 	|| attachment == DRI2BufferFrontLeft
@@ -399,18 +436,7 @@ static void
 update_dri2_drawable_buffers(DRI2DrawablePtr pPriv, DrawablePtr pDraw,
 			     DRI2BufferPtr *buffers, int out_count, int *width, int *height)
 {
-    DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
-    int i;
-
-    if (pPriv->buffers != NULL) {
-	for (i = 0; i < pPriv->bufferCount; i++) {
-	    if (pPriv->buffers[i] != NULL) {
-		(*ds->DestroyBuffer)(pDraw, pPriv->buffers[i]);
-	    }
-	}
-
-	free(pPriv->buffers);
-    }
+    destroy_buffers(pDraw, pPriv->buffers, pPriv->bufferCount);
 
     pPriv->buffers = buffers;
     pPriv->bufferCount = out_count;
@@ -454,6 +480,15 @@ do_get_buffers(DrawablePtr pDraw, int *width, int *height,
     for (i = 0; i < count; i++) {
 	const unsigned attachment = *(attachments++);
 	const unsigned format = (has_format) ? *(attachments++) : 0;
+
+	/* note: don't require a valid format for old drivers which don't
+	 * register their supported formats..
+	 */
+	if (has_format && (ds->numFormats > 0) && !valid_format(ds, format)) {
+	    xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
+		    "[DRI2] %s: bad format: %d\n", __func__, format);
+	    goto err_out;
+	}
 
 	if (allocate_or_reuse_buffer(pDraw, ds, pPriv, attachment,
 				     format, dimensions_match,
@@ -544,19 +579,11 @@ err_out:
 
     *out_count = 0;
 
-    if (buffers) {
-	for (i = 0; i < count; i++) {
-	    if (buffers[i] != NULL)
-		(*ds->DestroyBuffer)(pDraw, buffers[i]);
-	}
+    destroy_buffers(pDraw, buffers, count);
 
-	free(buffers);
-	buffers = NULL;
-    }
+    update_dri2_drawable_buffers(pPriv, pDraw, NULL, *out_count, width, height);
 
-    update_dri2_drawable_buffers(pPriv, pDraw, buffers, *out_count, width, height);
-
-    return buffers;
+    return NULL;
 }
 
 DRI2BufferPtr *
@@ -573,6 +600,95 @@ DRI2GetBuffersWithFormat(DrawablePtr pDraw, int *width, int *height,
 {
     return do_get_buffers(pDraw, width, height, attachments, count,
 			  out_count, TRUE);
+}
+
+DRI2BufferPtr *
+DRI2GetBuffersVid(DrawablePtr pDraw, int width, int height,
+	unsigned int *attachments, int count, int *out_count)
+{
+    DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
+    DRI2DrawablePtr pPriv = DRI2GetDrawable(pDraw);
+    DRI2BufferPtr  *buffers;
+    int i, n = 0;
+
+    if (!pPriv || !supports_video(ds)) {
+	*out_count = 0;
+	return NULL;
+    }
+
+    buffers = calloc(count, sizeof(buffers[0]));
+    if (!buffers)
+	goto err_out;
+
+    for (i = 0; i < count; i++) {
+	DRI2BufferPtr buf;
+	const unsigned attachment = *(attachments++);
+	const unsigned format = *(attachments++);
+
+	/* grow array of stored buffers if needed: */
+	if (attachment >= pPriv->bufferCount) {
+	    int n = attachment + 1;
+	    DRI2BufferPtr *newBuffers = realloc(pPriv->buffers,
+		    sizeof(pPriv->buffers[0]) * n);
+	    if (!newBuffers) {
+		xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
+			"[DRI2] %s: allocation failed for buffer: %d\n",
+			__func__, attachment);
+		goto err_out;
+	    }
+	    pPriv->buffers = newBuffers;
+	    memset(&pPriv->buffers[pPriv->bufferCount], 0,
+		    (n - pPriv->bufferCount) * sizeof(pPriv->buffers[0]));
+	    pPriv->bufferCount = n;
+	}
+
+	/* destroy any previous buffer at this attachment slot */
+	if (pPriv->buffers[attachment]) {
+	    (*ds->DestroyBuffer)(pDraw, pPriv->buffers[attachment]);
+	    pPriv->buffers[attachment] = NULL;
+	}
+
+	if ((width == 0) && (height == 0)) {
+	    /* client just wanted us to delete the buffer */
+	    continue;
+	}
+
+	if (!valid_format(ds, format)) {
+	    xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
+		    "[DRI2] %s: bad format: %d\n", __func__, format);
+	    goto err_out;
+	}
+
+	if (attachment == DRI2BufferFrontLeft) {
+	    buf = (*ds->CreateBuffer)(pDraw, attachment, format);
+	    /* note: don't expose front buffer to client */
+	} else {
+	    buf = (*ds->CreateBufferVid)(pDraw, attachment, format, width, height);
+	    buffers[n++] = buf;
+	}
+
+	if (! buf) {
+	    goto err_out;
+	}
+
+	pPriv->buffers[attachment] = buf;
+    }
+
+    *out_count = n;
+
+    return buffers;
+
+err_out:
+
+    *out_count = 0;
+
+    for (i = 0; i < n; i++)
+	if (buffers[i])
+	    pPriv->buffers[buffers[i]->attachment] = NULL;
+
+    destroy_buffers(pDraw, buffers, n);
+
+    return NULL;
 }
 
 static void
@@ -647,22 +763,14 @@ DRI2CopyRegion(DrawablePtr pDraw, RegionPtr pRegion,
 {
     DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
     DRI2DrawablePtr pPriv;
-    DRI2BufferPtr   pDestBuffer, pSrcBuffer;
-    int		    i;
+    DRI2BufferPtr   pDestBuffer = NULL, pSrcBuffer = NULL;
 
     pPriv = DRI2GetDrawable(pDraw);
     if (pPriv == NULL)
 	return BadDrawable;
 
-    pDestBuffer = NULL;
-    pSrcBuffer = NULL;
-    for (i = 0; i < pPriv->bufferCount; i++)
-    {
-	if (pPriv->buffers[i]->attachment == dest)
-	    pDestBuffer = (DRI2BufferPtr) pPriv->buffers[i];
-	if (pPriv->buffers[i]->attachment == src)
-	    pSrcBuffer = (DRI2BufferPtr) pPriv->buffers[i];
-    }
+    find_attachment(pPriv, dest, &pDestBuffer);
+    find_attachment(pPriv, src, &pSrcBuffer);
     if (pSrcBuffer == NULL || pDestBuffer == NULL)
 	return BadValue;
 
@@ -843,31 +951,28 @@ DRI2InvalidateWalk(WindowPtr pWin, pointer data)
     return WT_WALKCHILDREN;
 }
 
-int
-DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
-		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
-		DRI2SwapEventPtr func, void *data)
+static int
+swap_buffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
+	     CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
+	     DRI2SwapEventPtr func, void *data,
+	     Bool vid, unsigned int source, BoxPtr b)
 {
     ScreenPtr       pScreen = pDraw->pScreen;
     DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
-    DRI2DrawablePtr pPriv;
+    DRI2DrawablePtr pPriv = DRI2GetDrawable(pDraw);
     DRI2BufferPtr   pDestBuffer = NULL, pSrcBuffer = NULL;
-    int             ret, i;
+    int             ret;
     CARD64          ust, current_msc;
 
-    pPriv = DRI2GetDrawable(pDraw);
-    if (pPriv == NULL) {
+    if ((pPriv == NULL) || (vid && !supports_video(ds))) {
         xf86DrvMsg(pScreen->myNum, X_ERROR,
 		   "[DRI2] %s: bad drawable\n", __func__);
 	return BadDrawable;
     }
 
-    for (i = 0; i < pPriv->bufferCount; i++) {
-	if (pPriv->buffers[i]->attachment == DRI2BufferFrontLeft)
-	    pDestBuffer = (DRI2BufferPtr) pPriv->buffers[i];
-	if (pPriv->buffers[i]->attachment == DRI2BufferBackLeft)
-	    pSrcBuffer = (DRI2BufferPtr) pPriv->buffers[i];
-    }
+    find_attachment(pPriv, DRI2BufferFrontLeft, &pDestBuffer);
+    find_attachment(pPriv, source, &pSrcBuffer);
+
     if (pSrcBuffer == NULL || pDestBuffer == NULL) {
         xf86DrvMsg(pScreen->myNum, X_ERROR,
 		   "[DRI2] %s: drawable has no back or front?\n", __func__);
@@ -875,7 +980,7 @@ DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
     }
 
     /* Old DDX or no swap interval, just blit */
-    if (!ds->ScheduleSwap || !pPriv->swap_interval) {
+    if ((!ds->ScheduleSwap || !pPriv->swap_interval) && !vid) {
 	BoxRec box;
 	RegionRec region;
 
@@ -911,7 +1016,6 @@ DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
 
 	    if (current_msc < pPriv->last_swap_target)
 		pPriv->last_swap_target = current_msc;
-
 	}
 
 	/*
@@ -927,8 +1031,14 @@ DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
     }
 
     pPriv->swapsPending++;
-    ret = (*ds->ScheduleSwap)(client, pDraw, pDestBuffer, pSrcBuffer,
-			      swap_target, divisor, remainder, func, data);
+    if (vid) {
+	DrawablePtr osd = NULL;  // TODO
+	ret = (*ds->ScheduleSwapVid)(client, pDraw, pDestBuffer, pSrcBuffer,
+		b, osd, swap_target, divisor, remainder, func, data);
+    } else {
+	ret = (*ds->ScheduleSwap)(client, pDraw, pDestBuffer, pSrcBuffer,
+		swap_target, divisor, remainder, func, data);
+    }
     if (!ret) {
 	pPriv->swapsPending--; /* didn't schedule */
         xf86DrvMsg(pScreen->myNum, X_ERROR,
@@ -942,6 +1052,10 @@ DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
      * will complete.
      */
     *swap_target = pPriv->swap_count + pPriv->swapsPending;
+
+    if (vid) {
+	return Success;
+    }
 
     if (pDraw->type == DRAWABLE_WINDOW) {
 	WindowPtr	pWin = (WindowPtr) pDraw;
@@ -963,6 +1077,24 @@ DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
 	DRI2InvalidateDrawable(pDraw);
 
     return Success;
+}
+
+int
+DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
+		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
+		DRI2SwapEventPtr func, void *data)
+{
+    return swap_buffers(client, pDraw, target_msc, divisor, remainder,
+	    swap_target, func, data, FALSE, DRI2BufferBackLeft, NULL);
+}
+
+int
+DRI2SwapBuffersVid(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
+		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
+		unsigned int source, BoxPtr b, DRI2SwapEventPtr func, void *data)
+{
+    return swap_buffers(client, pDraw, target_msc, divisor, remainder,
+	    swap_target, func, data, TRUE, source, b);
 }
 
 void
@@ -1082,6 +1214,77 @@ DRI2HasSwapControl(ScreenPtr pScreen)
     return ds->ScheduleSwap && ds->GetMSC;
 }
 
+#define ATOM(a) MakeAtom(a, sizeof(a) - 1, TRUE)
+
+/* length in multiple of CARD32's, passed in value should be copied by
+ * receiver
+ */
+int
+DRI2SetAttribute(DrawablePtr pDraw, Atom attribute, int len, const CARD32 *val)
+{
+    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
+    int ret = BadMatch;
+
+    if (!supports_video(ds)) {
+	return BadDrawable;
+    }
+
+    if (attribute == ATOM("XV_OSD")) {
+    } else if (ds->SetAttribute) {
+	ret = (*ds->SetAttribute)(pDraw, attribute, len, val);
+    }
+
+    return ret;
+}
+
+/* length in multiple of CARD32's, returned val should *not* be free'd
+ * (unlike similar function on client side) to avoid temporary allocation
+ * and extra copy.
+ */
+int
+DRI2GetAttribute(DrawablePtr pDraw, Atom attribute, int *len, const CARD32 **val)
+{
+    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
+    int ret = BadMatch;
+
+    if (!supports_video(ds)) {
+	return BadDrawable;
+    }
+
+    if (attribute == ATOM("XV_OSD")) {
+    } else if (ds->GetAttribute) {
+	ret = (*ds->GetAttribute)(pDraw, attribute, len, val);
+    }
+
+    return ret;
+}
+
+int
+DRI2GetFormats(ScreenPtr pScreen, unsigned int *nformats, unsigned int **formats)
+{
+    DRI2ScreenPtr ds = DRI2GetScreen(pScreen);
+
+    if (! supports_video(ds)) {
+	return BadDrawable;
+    }
+
+    *nformats = ds->numFormats;
+    *formats  = ds->formats;
+
+    return Success;
+}
+
+unsigned int
+DRI2GetExtraBufferNames(DrawablePtr pDraw, DRI2BufferPtr buf,
+	unsigned int **names, unsigned int **pitches)
+{
+    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
+    if (ds->GetExtraBufferNames) {
+	return (*ds->GetExtraBufferNames)(pDraw, buf, names, pitches);
+    }
+    return 0;
+}
+
 Bool
 DRI2Connect(ScreenPtr pScreen, unsigned int driverType, int *fd,
 	    const char **driverName, const char **deviceName)
@@ -1149,9 +1352,10 @@ DRI2ScreenInit(ScreenPtr pScreen, DRI2InfoPtr info)
     const char* driverTypeNames[] = {
 	"DRI", /* DRI2DriverDRI */
 	"VDPAU", /* DRI2DriverVDPAU */
+	"XV", /* DRI2DriverXV */
     };
     unsigned int i;
-    CARD8 cur_minor;
+    CARD8 cur_minor = 1;
 
     if (info->version < 3)
 	return FALSE;
@@ -1189,8 +1393,6 @@ DRI2ScreenInit(ScreenPtr pScreen, DRI2InfoPtr info)
 	ds->ScheduleWaitMSC = info->ScheduleWaitMSC;
 	ds->GetMSC = info->GetMSC;
 	cur_minor = 3;
-    } else {
-	cur_minor = 1;
     }
 
     if (info->version >= 5) {
@@ -1200,6 +1402,34 @@ DRI2ScreenInit(ScreenPtr pScreen, DRI2InfoPtr info)
     if (info->version >= 6) {
 	ds->ReuseBufferNotify = info->ReuseBufferNotify;
 	ds->SwapLimitValidate = info->SwapLimitValidate;
+    }
+
+    if (info->version >= 7) {
+	if ((info->numDrivers > DRI2DriverXV) &&
+		info->driverNames[DRI2DriverXV]) {
+	    /* if driver claims to support DRI2DriverXV, then ensure
+	     * it provides the required fxn ptrs:
+	     */
+	    if (!info->CreateBufferVid || !info->ScheduleSwapVid) {
+		xf86DrvMsg(pScreen->myNum, X_WARNING,
+			"[DRI2] DRI2DriverXV must implement "
+			"CreateBuffersVid and ScheduleSwapVid.\n");
+		goto err_out;
+	    }
+	}
+	ds->numFormats = info->numFormats;
+	ds->formats = malloc(info->numFormats * sizeof(*ds->formats));
+	if (!ds->formats)
+	    goto err_out;
+	memcpy(ds->formats, info->formats,
+		info->numFormats * sizeof(*ds->formats));
+	ds->GetExtraBufferNames = info->GetExtraBufferNames;
+	ds->CreateBufferVid = info->CreateBufferVid;
+	ds->ScheduleSwapVid = info->ScheduleSwapVid;
+	ds->SetAttribute = info->SetAttribute;
+	ds->GetAttribute = info->GetAttribute;
+
+	cur_minor = 4;
     }
 
     /*
@@ -1251,6 +1481,10 @@ DRI2ScreenInit(ScreenPtr pScreen, DRI2InfoPtr info)
 err_out:
     xf86DrvMsg(pScreen->myNum, X_WARNING,
             "[DRI2] Initialization failed for info version %d.\n", info->version);
+    if (ds) {
+	free(ds->formats);
+	free(ds->driverNames);
+    }
     free(ds);
     return FALSE;
 }

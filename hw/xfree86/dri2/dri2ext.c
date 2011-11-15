@@ -77,6 +77,7 @@ ProcDRI2QueryVersion(ClientPtr client)
 	swaps(&stuff->length);
 
     REQUEST_SIZE_MATCH(xDRI2QueryVersionReq);
+
     rep.type = X_Reply;
     rep.length = 0;
     rep.sequenceNumber = client->sequence;
@@ -205,12 +206,13 @@ ProcDRI2DestroyDrawable(ClientPtr client)
 
 
 static int
-send_buffers_reply(ClientPtr client, DrawablePtr pDrawable,
+send_buffers_reply(ClientPtr client, DrawablePtr pDrawable, int vid,
 		   DRI2BufferPtr *buffers, int count, int width, int height)
 {
     xDRI2GetBuffersReply rep;
-    int skip = 0;
-    int i;
+    int skip = 0, extra = 0;
+    unsigned int *names, *pitches;
+    int i, j;
 
     if (buffers == NULL)
 	    return BadAlloc;
@@ -226,8 +228,24 @@ send_buffers_reply(ClientPtr client, DrawablePtr pDrawable,
 	}
     }
 
+    if (vid) {
+	extra = 4 * (count - skip);
+
+	for (i = 0; i < count; i++) {
+	    /* Do not send the real front buffer of a window to the client.
+	     */
+	    if ((pDrawable->type == DRAWABLE_WINDOW)
+		    && (buffers[i]->attachment == DRI2BufferFrontLeft)) {
+		continue;
+	    }
+
+	    extra += 8 * DRI2GetExtraBufferNames(pDrawable, buffers[i],
+		    &names, &pitches);
+	}
+    }
+
     rep.type = X_Reply;
-    rep.length = (count - skip) * sizeof(xDRI2Buffer) / 4;
+    rep.length = ((count - skip) * sizeof(xDRI2Buffer) + extra) / 4;
     rep.sequenceNumber = client->sequence;
     rep.width = width;
     rep.height = height;
@@ -250,6 +268,17 @@ send_buffers_reply(ClientPtr client, DrawablePtr pDrawable,
 	buffer.cpp = buffers[i]->cpp;
 	buffer.flags = buffers[i]->flags;
 	WriteToClient(client, sizeof(xDRI2Buffer), &buffer);
+
+	if (vid) {
+	    CARD32 n = DRI2GetExtraBufferNames(pDrawable, buffers[i],
+		    &names, &pitches);
+	    WriteToClient(client, sizeof(n), &n);
+	    for (j = 0; j < n; j++) {
+		CARD32 name = names[j], pitch = pitches[j];
+		WriteToClient(client, sizeof(name), &name);
+		WriteToClient(client, sizeof(pitch), &pitch);
+	    }
+	}
     }
     return Success;
 }
@@ -277,8 +306,8 @@ ProcDRI2GetBuffers(ClientPtr client)
 			     attachments, stuff->count, &count);
 
 
-    return send_buffers_reply(client, pDrawable, buffers, count, width, height);
-
+    return send_buffers_reply(client, pDrawable, FALSE,
+	    buffers, count, width, height);
 }
 
 static int
@@ -302,7 +331,40 @@ ProcDRI2GetBuffersWithFormat(ClientPtr client)
     buffers = DRI2GetBuffersWithFormat(pDrawable, &width, &height,
 				       attachments, stuff->count, &count);
 
-    return send_buffers_reply(client, pDrawable, buffers, count, width, height);
+    return send_buffers_reply(client, pDrawable, FALSE,
+	    buffers, count, width, height);
+}
+
+static int
+ProcDRI2GetBuffersVid(ClientPtr client)
+{
+    REQUEST(xDRI2GetBuffersVidReq);
+    DrawablePtr pDrawable;
+    DRI2BufferPtr *buffers;
+    int status, count;
+    unsigned int *attachments;
+
+    REQUEST_FIXED_SIZE(xDRI2GetBuffersVidReq, stuff->count * (2 * 4));
+    if (!validDrawable(client, stuff->drawable, DixReadAccess | DixWriteAccess,
+		       &pDrawable, &status))
+	return status;
+
+    if (DRI2ThrottleClient(client, pDrawable))
+	return Success;
+
+    attachments = (unsigned int *) &stuff[1];
+    buffers = DRI2GetBuffersVid(pDrawable, stuff->width, stuff->height,
+				attachments, stuff->count, &count);
+
+    status = send_buffers_reply(client, pDrawable, TRUE, buffers, count, 0, 0);
+
+    /* note, unlike other DRI2GetBuffers variants, we allow requesting/
+     * returning just a subset of buffers.. so array that is returned is
+     * not the one held in pPriv, so must be free'd
+     */
+    free(buffers);
+
+    return status;
 }
 
 static int
@@ -402,6 +464,53 @@ ProcDRI2SwapBuffers(ClientPtr client)
 
     status = DRI2SwapBuffers(client, pDrawable, target_msc, divisor, remainder,
 			     &swap_target, DRI2SwapEvent, pDrawable);
+    if (status != Success)
+	return BadDrawable;
+
+    rep.type = X_Reply;
+    rep.length = 0;
+    rep.sequenceNumber = client->sequence;
+    load_swap_reply(&rep, swap_target);
+
+    WriteToClient(client, sizeof(xDRI2SwapBuffersReply), &rep);
+
+    return Success;
+}
+
+static int
+ProcDRI2SwapBuffersVid(ClientPtr client)
+{
+    REQUEST(xDRI2SwapBuffersVidReq);
+    xDRI2SwapBuffersReply rep;
+    DrawablePtr pDrawable;
+    CARD64 target_msc, divisor, remainder, swap_target;
+    BoxRec b;
+    int status;
+
+    REQUEST_SIZE_MATCH(xDRI2SwapBuffersVidReq);
+
+    if (!validDrawable(client, stuff->drawable,
+		       DixReadAccess | DixWriteAccess, &pDrawable, &status))
+	return status;
+
+    /*
+     * Ensures an out of control client can't exhaust our swap queue, and
+     * also orders swaps.
+     */
+    if (DRI2ThrottleClient(client, pDrawable))
+	return Success;
+
+    target_msc = vals_to_card64(stuff->target_msc_lo, stuff->target_msc_hi);
+    divisor = vals_to_card64(stuff->divisor_lo, stuff->divisor_hi);
+    remainder = vals_to_card64(stuff->remainder_lo, stuff->remainder_hi);
+
+    b.x1 = stuff->x1;
+    b.y1 = stuff->y1;
+    b.x2 = stuff->x2;
+    b.y2 = stuff->y2;
+
+    status = DRI2SwapBuffersVid(client, pDrawable, target_msc, divisor, remainder,
+	    &swap_target, stuff->source, &b, DRI2SwapEvent, pDrawable);
     if (status != Success)
 	return BadDrawable;
 
@@ -538,6 +647,87 @@ ProcDRI2WaitSBC(ClientPtr client)
 }
 
 static int
+ProcDRI2SetAttribute(ClientPtr client)
+{
+    REQUEST(xDRI2SetAttributeReq);
+    DrawablePtr pDrawable;
+    int status;
+    int len = (stuff->length * 4 - sizeof(xDRI2SetAttributeReq)) / 4;
+
+    REQUEST_FIXED_SIZE(xDRI2SetAttributeReq, len * 4);
+
+    if (!validDrawable(client, stuff->drawable,
+	    DixReadAccess | DixWriteAccess, &pDrawable, &status))
+	return status;
+
+    status = DRI2SetAttribute(pDrawable, stuff->attribute, len,
+	    (const CARD32 *)&stuff[1]);
+    if (status != Success)
+	return status;
+
+    return Success;
+}
+
+static int
+ProcDRI2GetAttribute(ClientPtr client)
+{
+    REQUEST(xDRI2GetAttributeReq);
+    xDRI2GetAttributeReply rep;
+    DrawablePtr pDrawable;
+    const CARD32 *val;
+    int status, len;
+
+    REQUEST_SIZE_MATCH(xDRI2GetAttributeReq);
+
+    if (!validDrawable(client, stuff->drawable, DixReadAccess, &pDrawable,
+	    &status))
+	return status;
+
+    status = DRI2GetAttribute(pDrawable, stuff->attribute, &len, &val);
+    if (status != Success)
+	return status;
+
+    rep.type = X_Reply;
+    rep.length = len;
+    rep.sequenceNumber = client->sequence;
+    WriteToClient(client, sizeof(xDRI2GetAttributeReply), &rep);
+    WriteToClient(client, len * 4, val);
+
+    return Success;
+}
+
+static int
+ProcDRI2GetFormats(ClientPtr client)
+{
+    REQUEST(xDRI2GetFormatsReq);
+    xDRI2GetFormatsReply rep;
+    DrawablePtr pDrawable;
+    unsigned int i, nformats, *formats;
+    int status;
+
+    REQUEST_SIZE_MATCH(xDRI2GetFormatsReq);
+
+    if (!validDrawable(client, stuff->drawable, DixReadAccess, &pDrawable,
+	    &status))
+	return status;
+
+    status = DRI2GetFormats(pDrawable->pScreen, &nformats, &formats);
+    if (status != Success)
+	return status;
+
+    rep.type = X_Reply;
+    rep.length = nformats * sizeof(*formats) / 4;
+    rep.sequenceNumber = client->sequence;
+    WriteToClient(client, sizeof(xDRI2GetFormatsReply), &rep);
+
+    for (i = 0; i < nformats; i++) {
+	WriteToClient(client, sizeof(formats[i]), &formats[i]);
+    }
+
+    return Success;
+}
+
+static int
 ProcDRI2Dispatch (ClientPtr client)
 {
     REQUEST(xReq);
@@ -575,6 +765,16 @@ ProcDRI2Dispatch (ClientPtr client)
 	return ProcDRI2WaitSBC(client);
     case X_DRI2SwapInterval:
 	return ProcDRI2SwapInterval(client);
+    case X_DRI2GetBuffersVid:
+	return ProcDRI2GetBuffersVid(client);
+    case X_DRI2SwapBuffersVid:
+	return ProcDRI2SwapBuffersVid(client);
+    case X_DRI2SetAttribute:
+	return ProcDRI2SetAttribute(client);
+    case X_DRI2GetAttribute:
+	return ProcDRI2GetAttribute(client);
+    case X_DRI2GetFormats:
+	return ProcDRI2GetFormats(client);
     default:
 	return BadRequest;
     }
