@@ -176,6 +176,41 @@ xf86_check_platform_slot(const struct xf86_platform_device *pd)
     return TRUE;
 }
 
+static int
+find_non_pci_driver(const char *busid, char *returnList[], int returnListMax)
+{
+    /* Add more entries here if we ever return more than 4 drivers for
+       any device */
+    const char *driverList[5] = { NULL, NULL, NULL, NULL, NULL };
+    int i = 0;
+    char *p, *s;
+
+    s = xstrdup(busid);
+    p = strtok(s, ":");
+
+    if (strcmp(p, "platform"))
+        goto out;
+
+    /* extract device name: */
+    p = strtok(NULL, ":");
+
+    /* check for special cases where DDX driver name does not match busid: */
+    if (!strcmp(p, "mdp")) {
+        driverList[i++] = "freedreno";
+    }
+
+    /* add name derived from busid last: */
+    driverList[i++] = p;
+
+    for (i = 0; (i < returnListMax) && (driverList[i] != NULL); i++) {
+        returnList[i] = xnfstrdup(driverList[i]);
+    }
+
+out:
+    free(s);
+    return i;                   /* Number of entries added */
+}
+
 /**
  *  @return The numbers of found devices that match with the current system
  *  drivers.
@@ -207,6 +242,9 @@ xf86PlatformMatchDriver(char *matches[], int nmatches)
 
             if ((info != NULL) && (j < nmatches)) {
                 j += xf86VideoPtrToDriverList(info, &(matches[j]), nmatches - j);
+            } else if (j < nmatches) {
+                char *busid = xf86_get_platform_attrib(i, ODEV_ATTRIB_BUSID);
+                j += find_non_pci_driver(busid, &(matches[j]), nmatches - j);
             }
         }
     }
@@ -225,6 +263,9 @@ xf86platformProbe(void)
         pci = FALSE;
     }
 
+    /* First pass, look for PCI devices.  If we find a suitable
+     * PCI device that takes priority.
+     */
     for (i = 0; i < xf86_num_platform_devices; i++) {
         char *busid = xf86_get_platform_attrib(i, ODEV_ATTRIB_BUSID);
 
@@ -232,6 +273,24 @@ xf86platformProbe(void)
             platform_find_pci_info(&xf86_platform_devices[i], busid);
         }
     }
+
+    /* if we found something, we are done: */
+    if (primaryBus.type != BUS_NONE)
+        return 0;
+
+    /* Second pass, look for real platform devices (ie. in the linux-
+     * kernel sense of platform device.. something that is not pci)
+     */
+    for (i = 0; i < xf86_num_platform_devices; i++) {
+        char *busid = xf86_get_platform_attrib(i, ODEV_ATTRIB_BUSID);
+
+        if (strncmp(busid, "platform:", 9) == 0) {
+            primaryBus.type = BUS_PLATFORM;
+            primaryBus.id.plat = &xf86_platform_devices[i];
+            break;
+        }
+    }
+
     return 0;
 }
 
@@ -368,10 +427,8 @@ xf86platformProbeDev(DriverPtr drvp)
                 /* for non-seat0 servers assume first device is the master */
                 if (ServerIsNotSeat0())
                     break;
-                if (xf86_platform_devices[j].pdev) {
-                    if (xf86IsPrimaryPlatform(&xf86_platform_devices[j]))
-                        break;
-                }
+                if (xf86IsPrimaryPlatform(&xf86_platform_devices[j]))
+                    break;
             }
         }
 
