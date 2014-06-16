@@ -546,10 +546,18 @@ InitOutput(ScreenInfo * pScreenInfo, int argc, char **argv)
             if (xf86DriverList[i]->Identify != NULL)
                 xf86DriverList[i]->Identify(0);
 
-            if (xf86DriverList[i]->driverFunc)
+            if (xf86DriverList[i]->driverFunc) {
                 xf86DriverList[i]->driverFunc(NULL,
                                               GET_REQUIRED_HW_INTERFACES,
                                               &flags);
+                /* also let the driver know that it is safe to
+                 * allow platformProbe() to claim the device
+                 * if it is a non-pci platform device:
+                 */
+                xf86DriverList[i]->driverFunc(NULL,
+                                              SERVER_SUPPORTS_NON_PCI_PLATFORM_DEVS,
+                                              NULL);
+            }
 
             if (NEED_IO_ENABLED(flags))
                 want_hw_access = TRUE;
